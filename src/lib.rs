@@ -21,7 +21,8 @@ static mut ASYNC_LOGGER: Option<&AsyncLogger> = None;
 
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-type BoxPlugin = Box<dyn std::io::Write + Send + 'static>;
+type BoxPlugin = Box<dyn std::io::Write + Send + Sync + 'static>;
+type BoxCustomFilter = Box<dyn CustomFilter>;
 type LevelFilter = RwLock<HashMap<String, log::LevelFilter>>;
 
 
@@ -60,6 +61,12 @@ pub struct Builder {
     use_console:    bool,
     use_async:      bool,
     plugin:         Option<BoxPlugin>,
+    filter:         Option<BoxCustomFilter>,
+}
+
+/// 自定义过滤函数
+pub trait CustomFilter: Send + Sync + 'static {
+    fn enabled(&self, record: &log::Record) -> bool;
 }
 
 struct AsyncLogger {
@@ -74,6 +81,7 @@ struct AsyncLogger {
     fmt_cache:      ArrayQueue<Vec<u8>>,            // 格式化日志条目时，从该处获取缓存变量存放最后格式化结果
     #[cfg(feature = "tokio")]
     msg_queue:      Mutex<VecDeque<Vec<u8>>>,       // 异步模式下，用于暂存等待写入日志文件的日志条目
+    filter:         Option<BoxCustomFilter>,        // 自定义日志过滤器，如果启用了自定义日志过滤器，则对象有值
     #[cfg(not(feature = "tokio"))]
     logger_data:    Mutex<LogData>,                 // 日志关联的动态变化的数据
     #[cfg(feature = "tokio")]
@@ -113,7 +121,8 @@ enum AsyncLogType {
 #[inline]
 pub fn init_log_simple(level: &str, log_file: String, log_file_max: &str,
         use_console: bool, use_async: bool) -> Result<()> {
-    init_log(parse_level(level)?, log_file, parse_size(log_file_max)?, use_console, use_async)
+    init_log_inner(parse_level(level)?, log_file, parse_size(log_file_max)?,
+    use_console, use_async, None, None)
 }
 
 /// It creates a new logger, initializes it, and then sets it as the global logger
@@ -139,155 +148,36 @@ pub fn init_log_simple(level: &str, log_file: String, log_file_max: &str,
 #[inline]
 pub fn init_log(level: log::LevelFilter, log_file: String, log_file_max: u32,
         use_console: bool, use_async: bool) -> Result<()> {
-    init_log_with_plugin(level, log_file, log_file_max, use_console, use_async, None)
+    init_log_inner(level, log_file, log_file_max, use_console, use_async, None, None)
 }
 
-#[cfg(feature = "tokio")]
 #[inline]
-pub fn init_log_with_plugin(level: log::LevelFilter, log_file: String, log_file_max: u32,
-        use_console: bool, _: bool, plugin: Option<Box<dyn std::io::Write + Send>>) -> Result<()> {
-
-    #[cfg(debug_assertions)]
-    debug_check_init();
-
-    log::set_max_level(level);
-
-    #[cfg(feature = "time")]
-    let dt_fmt = if level >= log::LevelFilter::Debug {
-        "[month]-[day] [hour]:[minute]:[second]"
-    } else {
-        "[year]-[month]-[day] [hour]:[minute]:[second]"
-    };
-    #[cfg(feature = "time")]
-    let dt_fmt = time::format_description::parse_owned::<2>(dt_fmt).unwrap();
-
-    #[cfg(feature = "chrono")]
-    let dt_fmt = if level >= log::LevelFilter::Debug {
-        "%m-%d %H:%M:%S"
-    } else {
-        "%Y-%m-%d %H:%M:%S"
-    }.to_owned();
-
-    let use_file = !log_file.is_empty();
-    let console = if use_console {
-        Some(BufWriter::new(tokio::io::stdout()))
-    } else {
-        None
-    };
-    let logger = Box::new(AsyncLogger {
-        level,
-        dt_fmt,
-        log_file,
-        max_size: log_file_max,
-        level_filter: RwLock::new(HashMap::new()),
-        fmt_cache: ArrayQueue::new(CACHE_STR_ARRAY_SIZE),
-        msg_queue: Mutex::new(VecDeque::new()),
-        logger_data: tokio::sync::Mutex::new(LogData {
-            log_size: 0,
-            use_file,
-            console,
-            fileout: None,
-            plugin,
-        }),
-    });
-
-    let logger = Box::leak(logger);
-    unsafe { ASYNC_LOGGER = Some(logger); }
-
-    // 设置全局日志对象
-    log::set_logger(logger).expect("init_log call set_logger error");
-
-    Ok(())
+pub fn init_log_with_plugin<P>(level: log::LevelFilter, log_file: String,
+        log_file_max: u32, use_console: bool, use_async: bool,
+        plugin: P) -> Result<()>
+where
+    P: std::io::Write + Send + Sync + 'static,
+{
+    init_log_inner(level, log_file, log_file_max, use_console, use_async,
+        Some(Box::new(plugin)), None)
 }
 
-#[cfg(not(feature = "tokio"))]
 #[inline]
-pub fn init_log_with_plugin(level: log::LevelFilter, log_file: String, log_file_max: u32,
-        use_console: bool, use_async: bool, plugin: Option<Box<dyn Write + Send>>) -> Result<()> {
+pub fn init_log_with_filter(level: log::LevelFilter, log_file: String,
+        log_file_max: u32, use_console: bool, use_async: bool,
+        filter: impl CustomFilter) -> Result<()> {
+    init_log_inner(level, log_file, log_file_max, use_console, use_async,
+        None, Some(Box::new(filter)))
+}
 
-    #[cfg(debug_assertions)]
-    debug_check_init();
-
-    log::set_max_level(level);
-
-    #[cfg(feature = "time")]
-    let dt_fmt = if level >= log::LevelFilter::Debug {
-        "[month]-[day] [hour]:[minute]:[second]"
-    } else {
-        "[year]-[month]-[day] [hour]:[minute]:[second]"
-    };
-    #[cfg(feature = "time")]
-    let dt_fmt = time::format_description::parse_owned::<2>(dt_fmt).unwrap();
-
-    #[cfg(feature = "chrono")]
-    let dt_fmt = if level >= log::LevelFilter::Debug {
-        "%m-%d %H:%M:%S"
-    } else {
-        "%Y-%m-%d %H:%M:%S"
-    }.to_owned();
-
-
-    let logger = Box::new(AsyncLogger {
-        level,
-        dt_fmt,
-        log_file,
-        max_size: log_file_max,
-        level_filter: RwLock::new(HashMap::new()),
-        fmt_cache: ArrayQueue::new(CACHE_STR_ARRAY_SIZE),
-        logger_data: Mutex::new(LogData {
-            log_size: 0,
-            console: None,
-            fileout: None,
-            sender: None,
-            plugin,
-        }),
-    });
-
-    let logger = Box::leak(logger);
-    unsafe { ASYNC_LOGGER = Some(logger); }
-    let mut logger_data = logger.logger_data.lock();
-
-    // 如果启用控制台输出，创建一个控制台共享句柄
-    if use_console {
-        logger_data.console = Some(LineWriter::new(std::io::stdout()));
-    }
-
-    // 如果启用文件输出，打开日志文件
-    if !logger.log_file.is_empty() {
-        let f = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&logger.log_file)?;
-        logger_data.log_size = std::fs::metadata(&logger.log_file)?.len() as u32;
-        logger_data.fileout = Some(LineWriter::new(f));
-    }
-
-    // 如果启用异步日志，开启一个线程不停读取channel中的数据进行日志写入，属于多生产者单消费者模式
-    if use_async {
-        let (sender, receiver) = std::sync::mpsc::channel::<AsyncLogType>();
-        logger_data.sender = Some(sender);
-        let logger: &AsyncLogger = logger;
-        std::thread::spawn(move || loop {
-            match receiver.recv() {
-                Ok(data) => match data {
-                    AsyncLogType::Message(mut msg) => {
-                        logger.write(&msg);
-                        msg.truncate(0);
-                        let _ = logger.fmt_cache.push(msg);
-                    },
-                    AsyncLogType::Flush => logger.flush_inner(),
-                },
-                Err(e) => {
-                    panic!("logger channel recv error: {}", e);
-                }
-            }
-        });
-    }
-
-    // 设置全局日志对象
-    log::set_logger(logger).expect("init_log call set_logger error");
-
-    Ok(())
+pub fn init_log_with_all<P>(level: log::LevelFilter, log_file: String,
+        log_file_max: u32, use_console: bool, use_async: bool,
+        plugin: P, filter: impl CustomFilter) -> Result<()>
+where
+    P: std::io::Write + Send + Sync + 'static,
+{
+    init_log_inner(level, log_file, log_file_max, use_console, use_async,
+        Some(Box::new(plugin)), Some(Box::new(filter)))
 }
 
 /// Set log level for target
@@ -390,7 +280,7 @@ impl AsyncLogger {
             logger_data.log_size += ws as u32;
         }
 
-        if let Some(ref mut plugin) = logger_data.plugin {
+        if let Some(plugin) = &mut logger_data.plugin {
             plugin.write_all(msg).expect("write log to plugin fail");
         }
     }
@@ -434,6 +324,9 @@ impl log::Log for AsyncLogger {
     #[cfg(feature = "tokio")]
     fn log(&self, record: &log::Record) {
         if !self.enabled(record.metadata()) { return; }
+        if let Some(filter) = &self.filter {
+            if !filter.enabled(record) { return; }
+        }
 
         #[cfg(feature = "time")]
         unsafe { time::util::local_offset::set_soundness(time::util::local_offset::Soundness::Unsound); }
@@ -472,6 +365,10 @@ impl log::Log for AsyncLogger {
     #[cfg(not(feature = "tokio"))]
     fn log(&self, record: &log::Record) {
         if !self.enabled(record.metadata()) { return; }
+        if let Some(filter) = &self.filter {
+            if !filter.enabled(record) { return; }
+        }
+
         #[cfg(feature = "time")]
         unsafe { time::util::local_offset::set_soundness(time::util::local_offset::Soundness::Unsound); }
         #[cfg(feature = "time")]
@@ -543,13 +440,14 @@ impl Builder {
             use_console:    true,
             use_async:      true,
             plugin:         None,
+            filter:         None,
         }
     }
 
     #[inline]
     pub fn builder(self) -> Result<()> {
-        init_log_with_plugin(self.level, self.log_file, self.log_file_max,
-                self.use_console, self.use_async, self.plugin)
+        init_log_inner(self.level, self.log_file, self.log_file_max,
+                self.use_console, self.use_async, self.plugin, self.filter)
     }
 
     #[inline]
@@ -594,12 +492,22 @@ impl Builder {
         Ok(self)
     }
 
-    pub fn plugin<T: std::io::Write + Send + 'static>(mut self, plugin: T) -> Self {
+    pub fn plugin<T: std::io::Write + Send + Sync + 'static>(mut self, plugin: T) -> Self {
         self.plugin = Some(Box::new(plugin));
+        self
+    }
+
+    pub fn filter(mut self, filter: impl CustomFilter) -> Self {
+        self.filter = Some(Box::new(filter));
         self
     }
 }
 
+impl<F: Fn(&log::Record) -> bool + Send + Sync + 'static> CustomFilter for F {
+    fn enabled(&self, record: &log::Record) -> bool {
+        self(record)
+    }
+}
 
 impl<'a> SkipAnsiColorIter<'a> {
     pub fn new(data: &'a [u8]) -> Self {
@@ -650,6 +558,156 @@ impl<'a> Iterator for SkipAnsiColorIter<'a> {
 
         None
     }
+}
+
+#[cfg(feature = "tokio")]
+pub fn init_log_inner(level: log::LevelFilter, log_file: String, log_file_max: u32,
+        use_console: bool, _: bool, plugin: Option<BoxPlugin>,
+        filter: Option<BoxCustomFilter>) -> Result<()> {
+
+    #[cfg(debug_assertions)]
+    debug_check_init();
+
+    log::set_max_level(level);
+
+    #[cfg(feature = "time")]
+    let dt_fmt = if level >= log::LevelFilter::Debug {
+        "[month]-[day] [hour]:[minute]:[second]"
+    } else {
+        "[year]-[month]-[day] [hour]:[minute]:[second]"
+    };
+    #[cfg(feature = "time")]
+    let dt_fmt = time::format_description::parse_owned::<2>(dt_fmt).unwrap();
+
+    #[cfg(feature = "chrono")]
+    let dt_fmt = if level >= log::LevelFilter::Debug {
+        "%m-%d %H:%M:%S"
+    } else {
+        "%Y-%m-%d %H:%M:%S"
+    }.to_owned();
+
+    let use_file = !log_file.is_empty();
+    let console = if use_console {
+        Some(BufWriter::new(tokio::io::stdout()))
+    } else {
+        None
+    };
+    let logger = Box::new(AsyncLogger {
+        level,
+        dt_fmt,
+        log_file,
+        max_size: log_file_max,
+        level_filter: RwLock::new(HashMap::new()),
+        fmt_cache: ArrayQueue::new(CACHE_STR_ARRAY_SIZE),
+        msg_queue: Mutex::new(VecDeque::new()),
+        filter,
+        logger_data: tokio::sync::Mutex::new(LogData {
+            log_size: 0,
+            use_file,
+            console,
+            fileout: None,
+            plugin,
+        }),
+    });
+
+    let logger = Box::leak(logger);
+    unsafe { ASYNC_LOGGER = Some(logger); }
+
+    // 设置全局日志对象
+    log::set_logger(logger).expect("init_log call set_logger error");
+
+    Ok(())
+}
+
+#[cfg(not(feature = "tokio"))]
+fn init_log_inner(level: log::LevelFilter, log_file: String,log_file_max: u32,
+        use_console: bool, use_async: bool, plugin: Option<BoxPlugin>,
+        filter: Option<BoxCustomFilter>) -> Result<()> {
+
+    #[cfg(debug_assertions)]
+    debug_check_init();
+
+    log::set_max_level(level);
+
+    #[cfg(feature = "time")]
+    let dt_fmt = if level >= log::LevelFilter::Debug {
+        "[month]-[day] [hour]:[minute]:[second]"
+    } else {
+        "[year]-[month]-[day] [hour]:[minute]:[second]"
+    };
+    #[cfg(feature = "time")]
+    let dt_fmt = time::format_description::parse_owned::<2>(dt_fmt).unwrap();
+
+    #[cfg(feature = "chrono")]
+    let dt_fmt = if level >= log::LevelFilter::Debug {
+        "%m-%d %H:%M:%S"
+    } else {
+        "%Y-%m-%d %H:%M:%S"
+    }.to_owned();
+
+
+    let logger = Box::new(AsyncLogger {
+        level,
+        dt_fmt,
+        log_file,
+        max_size: log_file_max,
+        level_filter: RwLock::new(HashMap::new()),
+        fmt_cache: ArrayQueue::new(CACHE_STR_ARRAY_SIZE),
+        filter,
+        logger_data: Mutex::new(LogData {
+            log_size: 0,
+            console: None,
+            fileout: None,
+            sender: None,
+            plugin,
+        }),
+    });
+
+    let logger = Box::leak(logger);
+    unsafe { ASYNC_LOGGER = Some(logger); }
+    let mut logger_data = logger.logger_data.lock();
+
+    // 如果启用控制台输出，创建一个控制台共享句柄
+    if use_console {
+        logger_data.console = Some(LineWriter::new(std::io::stdout()));
+    }
+
+    // 如果启用文件输出，打开日志文件
+    if !logger.log_file.is_empty() {
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&logger.log_file)?;
+        logger_data.log_size = std::fs::metadata(&logger.log_file)?.len() as u32;
+        logger_data.fileout = Some(LineWriter::new(f));
+    }
+
+    // 如果启用异步日志，开启一个线程不停读取channel中的数据进行日志写入，属于多生产者单消费者模式
+    if use_async {
+        let (sender, receiver) = std::sync::mpsc::channel::<AsyncLogType>();
+        logger_data.sender = Some(sender);
+        let logger: &AsyncLogger = logger;
+        std::thread::spawn(move || loop {
+            match receiver.recv() {
+                Ok(data) => match data {
+                    AsyncLogType::Message(mut msg) => {
+                        logger.write(&msg);
+                        msg.truncate(0);
+                        let _ = logger.fmt_cache.push(msg);
+                    },
+                    AsyncLogType::Flush => logger.flush_inner(),
+                },
+                Err(e) => {
+                    panic!("logger channel recv error: {}", e);
+                }
+            }
+        });
+    }
+
+    // 设置全局日志对象
+    log::set_logger(logger).expect("init_log call set_logger error");
+
+    Ok(())
 }
 
 
