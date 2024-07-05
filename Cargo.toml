@@ -1,6 +1,6 @@
 [package]
 name = "asynclog"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 authors = ["kiven <kivensoft@gmail.com>"]
 description = "A simple, asynchronous log library"
