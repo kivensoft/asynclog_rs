@@ -1,6 +1,6 @@
 [package]
 name = "asynclog"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["kiven <kivensoft@gmail.com>"]
@@ -19,4 +19,4 @@ parking_lot = "0.12"
 crossbeam = "0.8"
 time = { version = "0.3", optional = true, features = ["formatting", "local-offset"] }
 chrono = { version = "0.4", optional = true, features = ["serde"] }
-tokio = { version = "1", optional = true, features = ["io-util"] }
+tokio = { version = "1", optional = true, features = ["io-std", "io-util"] }
