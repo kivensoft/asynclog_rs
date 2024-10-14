@@ -1,13 +1,13 @@
-use std::{collections::HashMap, io::Write, mem::MaybeUninit, str::FromStr};
+use std::{
+    collections::{HashMap, VecDeque},
+    io::Write, mem::MaybeUninit, str::FromStr, sync::Mutex
+};
 
-use crossbeam::queue::ArrayQueue;
-use parking_lot::RwLock;
+use std::sync::RwLock;
 
 #[cfg(feature = "time")]
 use time::format_description::OwnedFormatItem;
 
-#[cfg(not(feature = "tokio"))]
-use parking_lot::Mutex;
 #[cfg(not(feature = "tokio"))]
 use std::{fs::File, io::{LineWriter, Stdout}, sync::mpsc::Sender};
 
@@ -87,7 +87,7 @@ struct AsyncLogger {
     log_file:       String,                         // 日志文件名
     max_size:       u32,                            // 日志文件允许的最大长度
     level_filter:   LevelFilter,                    // 用户自定义的过滤目标->过滤级别映射
-    fmt_cache:      ArrayQueue<Vec<u8>>,            // 格式化日志条目时，从该处获取缓存变量存放最后格式化结果
+    fmt_cache:      Mutex<VecDeque<Vec<u8>>>,       // 格式化日志条目时，从该处获取缓存变量存放最后格式化结果
     #[cfg(feature = "tokio")]
     msg_tx:         UnboundedSender<AsyncLogType>,  // 异步模式下，用于暂存等待写入日志文件的日志条目
     filter:         Option<BoxCustomFilter>,        // 自定义日志过滤器，如果启用了自定义日志过滤器，则对象有值
@@ -193,7 +193,9 @@ where
 /// * `target`: log target
 /// * `level`: The log level(off/error/warn/info/debug/trace)
 pub fn set_level(target: String, level: log::LevelFilter) {
-    get_async_logger().level_filter.write().insert(target, level);
+    if let Ok(mut f) = get_async_logger().level_filter.write() {
+        f.insert(target, level);
+    }
 }
 
 /// It takes a string and returns a `Result` of a `log::LevelFilter`
@@ -245,7 +247,13 @@ pub fn parse_size(size: &str) -> Result<u32> {
 impl AsyncLogger {
     // 输出日志到控制台和文件
     fn write(&self, msg: &[u8]) {
-        let mut logger_data = self.logger_data.lock();
+        let mut logger_data = match self.logger_data.lock() {
+            Ok(v) => v,
+            Err(e) => {
+                eprint!("log mutex lock failed: {e:?}");
+                return;
+            }
+        };
 
         // 如果启用了控制台输出，则写入控制台
         if let Some(ref mut console) = logger_data.console {
@@ -293,7 +301,13 @@ impl AsyncLogger {
 
     // 刷新日志的控制台和文件缓存
     fn flush_inner(&self) {
-        let mut logger_data = self.logger_data.lock();
+        let mut logger_data = match self.logger_data.lock() {
+            Ok(v) => v,
+            Err(e) => {
+                eprint!("log mutex lock failed: {e:?}");
+                return;
+            }
+        };
 
         if let Some(ref mut console) = logger_data.console {
             console.flush().expect("flush log console error");
@@ -310,22 +324,22 @@ impl AsyncLogger {
 impl log::Log for AsyncLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
         if metadata.level() <= self.level {
-            let level_filters = self.level_filter.read();
-            let mut target = metadata.target();
-            while !target.is_empty() {
-                if let Some(level) = level_filters.get(target) {
-                    return metadata.level() <= *level;
-                }
+            if let Ok(level_filters) = self.level_filter.read() {
+                let mut target = metadata.target();
+                while !target.is_empty() {
+                    if let Some(level) = level_filters.get(target) {
+                        return metadata.level() <= *level;
+                    }
 
-                target = match target.rfind("::") {
-                    Some(rpos) => &target[..rpos],
-                    None => ""
-                };
+                    target = match target.rfind("::") {
+                        Some(rpos) => &target[..rpos],
+                        None => ""
+                    };
+                }
+                return true;
             }
-            true
-        } else {
-            false
         }
+        false
     }
 
     #[cfg(feature = "tokio")]
@@ -392,11 +406,20 @@ impl log::Log for AsyncLogger {
         };
 
         // 异步写入模式
-        if let Some(ref sender) = self.logger_data.lock().sender {
-            // 采用独立的单线程写入日志的方式，向channel发送要写入的日志消息即可
-            sender.send(AsyncLogType::Message(msg)).unwrap();
-            return;
+        match self.logger_data.lock() {
+            Ok(logger_data) => {
+                if let Some(ref sender) = logger_data.sender {
+                    // 采用独立的单线程写入日志的方式，向channel发送要写入的日志消息即可
+                    sender.send(AsyncLogType::Message(msg)).unwrap();
+                    return;
+                }
+            },
+            Err(e) => {
+                eprint!("log mutex lock failed: {e:?}");
+                return;
+            }
         }
+
         // 同步写入模式
         self.write(&msg);
         put_msg_to_cache(msg);
@@ -413,12 +436,15 @@ impl log::Log for AsyncLogger {
 
     #[cfg(not(feature = "tokio"))]
     fn flush(&self) {
-        let logger_data = self.logger_data.lock();
-        if let Some(ref sender) = logger_data.sender {
-            sender.send(AsyncLogType::Flush).unwrap();
-        } else {
-            drop(logger_data);
-            self.flush_inner();
+        if let Ok(logger_data) = self.logger_data.lock() {
+            if let Some(ref sender) = logger_data.sender {
+                if let Err(e) = sender.send(AsyncLogType::Flush) {
+                    eprint!("failed in log::flush: {e:?}");
+                }
+            } else {
+                drop(logger_data);
+                self.flush_inner();
+            }
         }
     }
 
@@ -603,7 +629,7 @@ pub fn init_log_inner(
         log_file,
         max_size: log_file_max,
         level_filter: RwLock::new(HashMap::new()),
-        fmt_cache: ArrayQueue::new(CACHE_STR_ARRAY_SIZE),
+        fmt_cache: Mutex::new(VecDeque::with_capacity(CACHE_STR_ARRAY_SIZE)),
         msg_tx: tx,
         filter,
     };
@@ -664,6 +690,45 @@ fn init_log_inner(
         "%Y-%m-%d %H:%M:%S"
     }.to_owned();
 
+    // 如果启用控制台输出，创建一个控制台共享句柄
+    let console = if use_console {
+        Some(LineWriter::new(std::io::stdout()))
+    } else {
+        None
+    };
+
+    // 如果启用文件输出，打开日志文件
+    let (fileout, log_size) = if !log_file.is_empty() {
+        let f = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&log_file)?;
+        let log_size = std::fs::metadata(&log_file)?.len() as u32;
+        let fileout = Some(LineWriter::new(f));
+        (fileout, log_size)
+    } else {
+        (None, 0)
+    };
+
+    // 如果启用异步日志，开启一个线程不停读取channel中的数据进行日志写入，属于多生产者单消费者模式
+    let sender = if use_async {
+        let (sender, receiver) = std::sync::mpsc::channel::<AsyncLogType>();
+        std::thread::spawn(move || loop {
+            match receiver.recv() {
+                Ok(data) => match data {
+                    AsyncLogType::Message(msg) => {
+                        get_async_logger().write(&msg);
+                        put_msg_to_cache(msg);
+                    },
+                    AsyncLogType::Flush => get_async_logger().flush_inner(),
+                },
+                Err(e) => eprintln!("logger channel recv error: {}", e),
+            }
+        });
+        Some(sender)
+    } else {
+        None
+    };
 
     let logger = AsyncLogger {
         level,
@@ -671,13 +736,13 @@ fn init_log_inner(
         log_file,
         max_size: log_file_max,
         level_filter: RwLock::new(HashMap::new()),
-        fmt_cache: ArrayQueue::new(CACHE_STR_ARRAY_SIZE),
+        fmt_cache: Mutex::new(VecDeque::with_capacity(CACHE_STR_ARRAY_SIZE)),
         filter,
         logger_data: Mutex::new(LogData {
-            log_size: 0,
-            console: None,
-            fileout: None,
-            sender: None,
+            log_size,
+            console,
+            fileout,
+            sender,
             plugin,
         }),
     };
@@ -689,43 +754,6 @@ fn init_log_inner(
             INITED = true;
         }
         ASYNC_LOGGER.write(logger);
-    }
-    let logger = get_async_logger();
-    let mut logger_data = logger.logger_data.lock();
-
-    // 如果启用控制台输出，创建一个控制台共享句柄
-    if use_console {
-        logger_data.console = Some(LineWriter::new(std::io::stdout()));
-    }
-
-    // 如果启用文件输出，打开日志文件
-    if !logger.log_file.is_empty() {
-        let f = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&logger.log_file)?;
-        logger_data.log_size = std::fs::metadata(&logger.log_file)?.len() as u32;
-        logger_data.fileout = Some(LineWriter::new(f));
-    }
-
-    // 如果启用异步日志，开启一个线程不停读取channel中的数据进行日志写入，属于多生产者单消费者模式
-    if use_async {
-        let (sender, receiver) = std::sync::mpsc::channel::<AsyncLogType>();
-        logger_data.sender = Some(sender);
-        std::thread::spawn(move || loop {
-            match receiver.recv() {
-                Ok(data) => match data {
-                    AsyncLogType::Message(msg) => {
-                        logger.write(&msg);
-                        put_msg_to_cache(msg);
-                    },
-                    AsyncLogType::Flush => logger.flush_inner(),
-                },
-                Err(e) => {
-                    panic!("logger channel recv error: {}", e);
-                }
-            }
-        });
     }
 
     // 设置全局日志对象
@@ -914,17 +942,25 @@ fn level_color(level: log::Level) -> &'static str {
 
 /// 获取一个用于保存格式化日志条目的对象, 优先从缓存获取，缓存没有则新建一个
 fn get_msg_from_cache() -> Vec<u8> {
-    match get_async_logger().fmt_cache.pop() {
-        Some(v) => v,
-        None => Vec::with_capacity(CACHE_STR_INIT_SIZE)
+    if let Ok(mut fmt_cache) = get_async_logger().fmt_cache.lock() {
+            if let Some(vec) = fmt_cache.pop_back() {
+                return vec;
+            }
     }
+
+    Vec::with_capacity(CACHE_STR_INIT_SIZE)
 }
 
 /// 回收Vec<u8>对象，用于下次使用，避免频繁分配内存造成内存碎片
 fn put_msg_to_cache(mut value: Vec<u8>) {
     if value.capacity() <= CACHE_STR_INIT_SIZE {
         value.clear();
-        let _ = get_async_logger().fmt_cache.push(value);
+
+        if let Ok(mut fmt_cache) = get_async_logger().fmt_cache.lock() {
+            if fmt_cache.len() < fmt_cache.capacity() {
+                fmt_cache.push_back(value);
+            }
+        }
     }
 }
 
