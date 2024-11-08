@@ -357,18 +357,24 @@ impl log::Log for AsyncLogger {
         let now = chrono::Local::now().format(&self.dt_fmt);
 
         let mut msg = get_msg_from_cache();
+        let is_detail = self.level >= log::LevelFilter::Debug;
+        let log_level = record.level();
 
         // 日志条目格式化
-        if self.level >= log::LevelFilter::Debug {
-            write!(&mut msg, "[\x1b[36m{now}\x1b[0m] [{}{:5}\x1b[0m] [{}::{}] - {}\n",
-                    level_color(record.level()),
-                    record.level(),
-                    record.target(),
-                    record.line().unwrap_or(0),
-                    record.args()).unwrap();
+        if is_detail {
+            write!(&mut msg, "[\x1b[36m{now}\x1b[0m] [{}{log_level:5}\x1b[0m]",
+                level_color(log_level),
+            ).unwrap();
         } else {
-            write!(&mut msg, "[{now}] [{:5}] - {}\n", record.level(), record.args()).unwrap();
+            write!(&mut msg, "[{now}] [{log_level:5}]").unwrap();
+        }
+        if let Some(task_id) = tokio::task::try_id() {
+            write!(&mut msg, " [TASK-{task_id}]").unwrap();
+        }
+        if is_detail {
+            write!(&mut msg, " [{}::{}]", record.target(), record.line().unwrap_or(0)).unwrap();
         };
+        write!(&mut msg, " - {}\n", record.args()).unwrap();
 
         // 将需要输出的日志条目加入队列尾部，并返回是否已有任务正在处理日志
         if let Err(e) = get_async_logger().msg_tx.send(AsyncLogType::Message(msg)) {
@@ -599,11 +605,12 @@ pub fn init_log_inner(
     log::set_max_level(level);
 
     #[cfg(feature = "time")]
-    let dt_fmt = if level >= log::LevelFilter::Debug {
-        "[month]-[day] [hour]:[minute]:[second]"
-    } else {
-        "[year]-[month]-[day] [hour]:[minute]:[second]"
-    };
+    // let dt_fmt = if level >= log::LevelFilter::Debug {
+    //     "[month]-[day] [hour]:[minute]:[second]"
+    // } else {
+    //     "[year]-[month]-[day] [hour]:[minute]:[second]"
+    // };
+    let dt_fmt = "[year]-[month]-[day] [hour]:[minute]:[second]";
     #[cfg(feature = "time")]
     let dt_fmt = time::format_description::parse_owned::<2>(dt_fmt).unwrap();
 
