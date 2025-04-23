@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    io::Write, mem::MaybeUninit, str::FromStr, sync::Mutex
+    io::Write, str::FromStr, sync::{Mutex, OnceLock}
 };
 
 use std::sync::RwLock;
@@ -21,9 +21,7 @@ use tokio::{
 const CACHE_STR_ARRAY_SIZE: usize = 16;
 const CACHE_STR_INIT_SIZE: usize = 256;
 
-static mut ASYNC_LOGGER: MaybeUninit<AsyncLogger> = MaybeUninit::uninit();
-#[cfg(debug_assertions)]
-static mut INITED: bool = false;
+static ASYNC_LOGGER: OnceLock<AsyncLogger> = OnceLock::new();
 
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -350,8 +348,6 @@ impl log::Log for AsyncLogger {
         }
 
         #[cfg(feature = "time")]
-        unsafe { time::util::local_offset::set_soundness(time::util::local_offset::Soundness::Unsound); }
-        #[cfg(feature = "time")]
         let now = time::OffsetDateTime::now_local().unwrap().format(&self.dt_fmt).unwrap();
         #[cfg(feature = "chrono")]
         let now = chrono::Local::now().format(&self.dt_fmt);
@@ -390,8 +386,6 @@ impl log::Log for AsyncLogger {
             if !filter.enabled(record) { return; }
         }
 
-        #[cfg(feature = "time")]
-        unsafe { time::util::local_offset::set_soundness(time::util::local_offset::Soundness::Unsound); }
         #[cfg(feature = "time")]
         let now = time::OffsetDateTime::now_local().unwrap().format(&self.dt_fmt).unwrap();
         #[cfg(feature = "chrono")]
@@ -598,6 +592,8 @@ pub fn init_log_inner(
     filter: Option<BoxCustomFilter>
 ) -> Result<()>
 {
+    use core::panic;
+
 
     #[cfg(debug_assertions)]
     debug_check_init();
@@ -640,14 +636,8 @@ pub fn init_log_inner(
         msg_tx: tx,
         filter,
     };
-
-    unsafe {
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(!INITED);
-            INITED = true;
-        }
-        ASYNC_LOGGER.write(logger);
+    if ASYNC_LOGGER.set(logger).is_err() {
+        panic!("async logger init failed");
     }
 
     // 设置全局日志对象
@@ -753,14 +743,8 @@ fn init_log_inner(
             plugin,
         }),
     };
-
-    unsafe {
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(!INITED);
-            INITED = true;
-        }
-        ASYNC_LOGGER.write(logger);
+    if ASYNC_LOGGER.set(logger).is_err() {
+        panic!("async logger init failed");
     }
 
     // 设置全局日志对象
@@ -918,11 +902,9 @@ async fn write_to_log(log_data: &mut LogData, msg: &[u8]) {
 }
 
 fn get_async_logger() -> &'static AsyncLogger {
-    unsafe {
-        #[cfg(debug_assertions)]
-        debug_assert!(INITED);
-
-        ASYNC_LOGGER.assume_init_ref()
+    match ASYNC_LOGGER.get() {
+        Some(ref logger) => logger,
+        None => unsafe { std::hint::unreachable_unchecked() }
     }
 }
 
