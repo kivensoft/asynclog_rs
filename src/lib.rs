@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     io::Write,
     str::FromStr,
     sync::{Mutex, OnceLock},
@@ -7,17 +7,19 @@ use std::{
 
 use std::sync::RwLock;
 
+use fnv::FnvHashMap;
+
 #[cfg(feature = "time")]
 use time::format_description::OwnedFormatItem;
 
+#[cfg(feature = "tokio")]
+use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(not(feature = "tokio"))]
 use std::{
     fs::File,
     io::{LineWriter, Stdout},
     sync::mpsc::Sender,
 };
-#[cfg(feature = "tokio")]
-use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(feature = "tokio")]
 use tokio::{
@@ -43,15 +45,13 @@ tokio::task_local! {
     static TRACE_ID: u32;
 }
 
-
 type IoResult<T> = std::io::Result<T>;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type BoxPlugin = Box<dyn std::io::Write + Send + Sync + 'static>;
 type BoxCustomFilter = Box<dyn CustomFilter>;
-type LevelFilter = RwLock<HashMap<String, log::LevelFilter>>;
+type LevelFilter = RwLock<FnvHashMap<String, log::LevelFilter>>;
 #[cfg(feature = "tokio")]
 type LogRecv = UnboundedReceiver<AsyncLogType>;
-
 
 /// `LogOptions` is a struct that holds the configuration for the logger.
 ///
@@ -171,7 +171,6 @@ enum AsyncLogType {
     Flush,
 }
 
-
 /// get a new trace_id value of next from current trace_id
 #[cfg(feature = "tokio")]
 pub fn next_trace_id() -> u32 {
@@ -181,10 +180,7 @@ pub fn next_trace_id() -> u32 {
 /// get current trace_id value
 #[cfg(feature = "tokio")]
 pub fn get_trace_id() -> Option<u32> {
-    match TRACE_ID.try_get() {
-        Ok(id) => Some(id),
-        Err(_) => None,
-    }
+    TRACE_ID.try_get().ok()
 }
 
 /// Set log level for target
@@ -272,7 +268,7 @@ pub fn init_log_inner(opts: LogOptions) -> Result<()> {
         None
     };
 
-    let level_filter = RwLock::new(HashMap::new());
+    let level_filter = RwLock::new(FnvHashMap::default());
     let fmt_cache = Mutex::new(VecDeque::with_capacity(CACHE_STR_ARRAY_SIZE));
 
     #[cfg(not(feature = "tokio"))]
@@ -280,7 +276,10 @@ pub fn init_log_inner(opts: LogOptions) -> Result<()> {
         let lf = &opts.log_file;
         // 如果启用文件输出，打开日志文件
         let (fileout, log_size) = if !lf.is_empty() {
-            let f = std::fs::OpenOptions::new().append(true).create(true).open(lf)?;
+            let f = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(lf)?;
             let log_size = std::fs::metadata(lf)?.len() as u32;
             let fileout = Some(LineWriter::new(f));
             (fileout, log_size)
@@ -371,7 +370,6 @@ pub fn init_log_inner(opts: LogOptions) -> Result<()> {
     Ok(())
 }
 
-
 #[cfg(not(feature = "tokio"))]
 impl AsyncLogger {
     // 输出日志到控制台和文件
@@ -416,7 +414,12 @@ impl AsyncLogger {
                     eprint!("backup log file fail: {} -> {bak}", &self.log_file);
                 }
 
-                match std::fs::OpenOptions::new().write(true).create(true).open(&self.log_file) {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&self.log_file)
+                {
                     Ok(file) => {
                         logger_data.fileout = Some(LineWriter::new(file));
                         logger_data.log_size = 0;
@@ -433,10 +436,10 @@ impl AsyncLogger {
             logger_data.log_size += ws as u32;
         }
 
-        if let Some(plugin) = &mut logger_data.plugin {
-            if let Err(e) = plugin.write_all(msg) {
-                eprint!("plugin write error: {e:?}");
-            }
+        if let Some(plugin) = &mut logger_data.plugin
+            && let Err(e) = plugin.write_all(msg)
+        {
+            eprint!("plugin write error: {e:?}");
         }
     }
 
@@ -482,7 +485,10 @@ impl AsyncLogger {
         // 格式化时间及日志级别
         if is_detail {
             let lc = level_color(log_level);
-            let _ = write!(&mut msg, "[\x1b[36m{now}\x1b[0m] [{lc}{log_level:5}\x1b[0m]");
+            let _ = write!(
+                &mut msg,
+                "[\x1b[36m{now}\x1b[0m] [{lc}{log_level:5}\x1b[0m]"
+            );
         } else {
             let _ = write!(&mut msg, "[{now}] [{log_level:5}]");
         }
@@ -513,6 +519,7 @@ impl AsyncLogger {
         };
 
         // 格式化日志内容
+        #[allow(clippy::write_with_newline)]
         let _ = write!(&mut msg, " - {}\n", record.args());
 
         Some(msg)
@@ -521,21 +528,21 @@ impl AsyncLogger {
 
 impl log::Log for AsyncLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        if metadata.level() <= self.level {
-            if let Ok(level_filters) = self.level_filter.read() {
-                let mut target = metadata.target();
-                while !target.is_empty() {
-                    if let Some(level) = level_filters.get(target) {
-                        return metadata.level() <= *level;
-                    }
-
-                    target = match target.rfind("::") {
-                        Some(rpos) => &target[..rpos],
-                        None => "",
-                    };
+        if metadata.level() <= self.level
+            && let Ok(level_filters) = self.level_filter.read()
+        {
+            let mut target = metadata.target();
+            while !target.is_empty() {
+                if let Some(level) = level_filters.get(target) {
+                    return metadata.level() <= *level;
                 }
-                return true;
+
+                target = match target.rfind("::") {
+                    Some(rpos) => &target[..rpos],
+                    None => "",
+                };
             }
+            return true;
         }
         false
     }
@@ -604,9 +611,8 @@ impl log::Log for AsyncLogger {
     }
 }
 
-
-impl LogOptions {
-    pub fn new() -> Self {
+impl Default for LogOptions {
+    fn default() -> Self {
         Self {
             level: log::LevelFilter::Info,
             log_file: String::new(),
@@ -616,6 +622,12 @@ impl LogOptions {
             plugin: None,
             filter: None,
         }
+    }
+}
+
+impl LogOptions {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// 根据参数配置, 初始化日志配置
@@ -678,13 +690,11 @@ impl LogOptions {
     }
 }
 
-
 impl<F: Fn(&log::Record) -> bool + Send + Sync + 'static> CustomFilter for F {
     fn enabled(&self, record: &log::Record) -> bool {
         self(record)
     }
 }
-
 
 impl<'a> SkipAnsiColorIter<'a> {
     pub fn new(data: &'a [u8]) -> Self {
@@ -734,7 +744,6 @@ impl<'a> Iterator for SkipAnsiColorIter<'a> {
         None
     }
 }
-
 
 /// 将格式化后的消息内容同步写入日志文件
 #[cfg(not(feature = "tokio"))]
@@ -793,15 +802,15 @@ async fn write_async(mut log_data: LogData, mut rx: LogRecv) {
                 put_msg_to_cache(msg);
             }
             AsyncLogType::Flush => {
-                if let Some(ref mut console) = log_data.console {
-                    if let Err(e) = console.flush().await {
-                        println!("flush log to console failed: {e:?}");
-                    }
+                if let Some(ref mut console) = log_data.console
+                    && let Err(e) = console.flush().await
+                {
+                    println!("flush log to console failed: {e:?}");
                 }
-                if let Some(ref mut fileout) = log_data.fileout {
-                    if let Err(e) = fileout.flush().await {
-                        println!("flush log to file failed: {e:?}");
-                    }
+                if let Some(ref mut fileout) = log_data.fileout
+                    && let Err(e) = fileout.flush().await
+                {
+                    println!("flush log to file failed: {e:?}");
                 }
             }
         }
@@ -878,12 +887,12 @@ async fn write_to_log(log_data: &mut LogData, msg: &[u8]) {
     }
 
     // 如果启用了控制台输出，则写入控制台
-    if let Some(ref mut console) = log_data.console {
-        if console.write_all(&msg).await.is_ok() {
-            let c = msg[msg.len() - 1];
-            if c == b'\n' || c == b'\r' {
-                let _ = console.flush().await;
-            }
+    if let Some(ref mut console) = log_data.console
+        && console.write_all(msg).await.is_ok()
+    {
+        let c = msg[msg.len() - 1];
+        if c == b'\n' || c == b'\r' {
+            let _ = console.flush().await;
         }
     }
 
@@ -893,23 +902,23 @@ async fn write_to_log(log_data: &mut LogData, msg: &[u8]) {
     }
 
     if let Some(ref mut fileout) = log_data.fileout {
-        match write_text(fileout, &msg).await {
+        match write_text(fileout, msg).await {
             Ok(size) => log_data.log_size += size as u32,
             Err(e) => eprintln!("failed in write to file: {e:?}"),
         }
     }
 
     // 日志输出到插件中(如果存在的话)
-    if let Some(ref mut plugin) = log_data.plugin {
-        if let Err(e) = plugin.write_all(&msg) {
-            eprintln!("failed in log plugin: {e:?}");
-        }
+    if let Some(ref mut plugin) = log_data.plugin
+        && let Err(e) = plugin.write_all(msg)
+    {
+        eprintln!("failed in log plugin: {e:?}");
     }
 }
 
 fn get_async_logger() -> &'static AsyncLogger {
     match ASYNC_LOGGER.get() {
-        Some(ref logger) => logger,
+        Some(logger) => logger,
         None => unsafe { std::hint::unreachable_unchecked() },
     }
 }
@@ -952,10 +961,10 @@ fn now_as_str(fmt: &OwnedFormatItem) -> String {
 
 /// 获取一个用于保存格式化日志条目的对象, 优先从缓存获取，缓存没有则新建一个
 fn get_msg_from_cache() -> Vec<u8> {
-    if let Ok(mut fmt_cache) = get_async_logger().fmt_cache.lock() {
-        if let Some(vec) = fmt_cache.pop_back() {
-            return vec;
-        }
+    if let Ok(mut fmt_cache) = get_async_logger().fmt_cache.lock()
+        && let Some(vec) = fmt_cache.pop_back()
+    {
+        return vec;
     }
 
     Vec::with_capacity(CACHE_STR_INIT_SIZE)
@@ -966,10 +975,10 @@ fn put_msg_to_cache(mut value: Vec<u8>) {
     if value.capacity() <= CACHE_STR_INIT_SIZE {
         value.clear();
 
-        if let Ok(mut fmt_cache) = get_async_logger().fmt_cache.lock() {
-            if fmt_cache.len() < fmt_cache.capacity() {
-                fmt_cache.push_back(value);
-            }
+        if let Ok(mut fmt_cache) = get_async_logger().fmt_cache.lock()
+            && fmt_cache.len() < fmt_cache.capacity()
+        {
+            fmt_cache.push_back(value);
         }
     }
 }
@@ -981,7 +990,8 @@ fn debug_check_init() {
 
     static INITED: AtomicBool = AtomicBool::new(false);
 
-    if let Err(true) = INITED.compare_exchange(false, true, Ordering::Release, Ordering::Relaxed) {
+    let r = INITED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+    if r.is_err() {
         panic!("init_log must run once!");
     }
 }
