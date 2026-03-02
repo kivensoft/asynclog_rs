@@ -1,13 +1,177 @@
+//! # `asynclog` async logging implementation
+//!
+//! ## Overview
+//!
+//! `asynclog` is a high-performance, asynchronous logging library designed for Rust applications.
+//! It offers flexible configuration options, including log level control, file output, console output,
+//! asynchronous writing, and support for custom plugins and filters.
+//!
+//! ## Key Features
+//!
+//! - **Log Level Control**: Supports standard log levels (`trace`, `debug`, `info`, `warn`, `error`, `off`).
+//! - **Multiple Output Targets**:
+//!   - Console output (with ANSI color support)
+//!   - File output (with automatic log rotation)
+//! - **Asynchronous Writing**: Efficient log writing via background tasks or thread pools.
+//! - **Custom Plugins**: Allows extending log output behavior.
+//! - **Custom Filters**: Supports conditional filtering of log records.
+//! - **Cache Optimization**: Internal caching reduces memory allocation overhead.
+//! - **Cross-Platform Compatibility**: Supports both `tokio` and synchronous modes.
+//!
+//! ## Quick Start
+//!
+//! ### 1. Add Dependency
+//!
+//! Add the following to your [Cargo.toml](file://f:\asynclog\Cargo.toml):
+//!
+//! ```toml
+//! [dependencies]
+//! asynclog = { version = "0.1", features = ["tokio"] }
+//! ```
+//!
+//! If asynchronous support is not needed, remove `features = ["tokio"]`.
+//!
+//! ### 2. Initialize Logging
+//!
+//! ```rust
+//! use asynclog::{LogOptions, parse_level};
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Build log configuration
+//!     let opts = LogOptions::new()
+//!         .level(parse_level("info")?) // Set log level to info
+//!         .log_file("app.log".to_string()) // Output to file
+//!         .log_file_max_str("10M")? // Maximum log file size: 10MB
+//!         .use_console(true) // Enable console output
+//!         .use_async(true); // Enable asynchronous writing
+//!
+//!     // Initialize the logging system
+//!     opts.builder()?;
+//!
+//!     // Start logging
+//!     log::info!("Application started");
+//!     log::debug!("This is a debug message");
+//!     log::error!("Something went wrong!");
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Configuration Details
+//!
+//! ### `LogOptions` Struct
+//!
+//! The `LogOptions` struct provides rich configuration options for customizing logging behavior.
+//!
+//! #### Method List
+//!
+//! | Method Name        | Parameter Type              | Description                              |
+//! |--------------------|-----------------------------|------------------------------------------|
+//! | `level`            | `log::LevelFilter`          | Sets the minimum log level               |
+//! | `log_file`         | `String`                    | Sets the log file path                   |
+//! | `log_file_max`     | `u32`                       | Sets the maximum log file size (bytes)   |
+//! | `use_console`      | `bool`                      | Enables/disables console output          |
+//! | `use_async`        | `bool`                      | Enables/disables asynchronous writing    |
+//! | `plugin`           | `Box<dyn Write + Send>`     | Registers a custom log plugin            |
+//! | `filter`           | `impl CustomFilter`         | Registers a custom log filter            |
+//! | `level_str`        | `&str`                      | Sets log level using a string            |
+//! | `log_file_max_str` | `&str`                      | Sets max log file size using a string    |
+//!
+//! ## Feature Details
+//!
+//! ### 1. Log Levels
+//!
+//! Supported standard log levels include:
+//!
+//! - `trace`: Most detailed debugging information
+//! - `debug`: Debugging information
+//! - `info`: General information
+//! - `warn`: Warning messages
+//! - `error`: Error messages
+//! - `off`: Disable all logging
+//!
+//! You can dynamically adjust the log level for specific modules using the `set_level` function:
+//!
+//! ```rust
+//! asynclog::set_level("my_module".to_string(), log::LevelFilter::Warn);
+//! ```
+//!
+//! ### 2. Asynchronous Writing
+//!
+//! When enabled, logs are processed by background tasks without blocking the main thread.
+//! Ideal for high-concurrency scenarios.
+//!
+//! ```rust
+//! let opts = LogOptions::new().use_async(true);
+//! ```
+//!
+//! ### 3. Log File Rotation
+//!
+//! When the log file reaches its maximum size, it is automatically renamed with a `.bak` suffix,
+//! and a new file is created.
+//!
+//! ```rust
+//! let opts = LogOptions::new().log_file_max(10 * 1024 * 1024); // 10MB
+//! ```
+//!
+//! ### 4. Custom Plugins
+//!
+//! Plugins can intercept each log record and execute custom logic.
+//! For example, sending logs to a remote server:
+//!
+//! ```rust
+//! use std::io::Write;
+//!
+//! struct RemoteLogger;
+//!
+//! impl Write for RemoteLogger {
+//!     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+//!         // Send log to remote server
+//!         println!("Sending log: {}", String::from_utf8_lossy(buf));
+//!         Ok(buf.len())
+//!     }
+//!
+//!     fn flush(&mut self) -> std::io::Result<()> {
+//!         Ok(())
+//!     }
+//! }
+//!
+//! let opts = LogOptions::new().plugin(RemoteLogger);
+//! ```
+//!
+//! ### 5. Custom Filters
+//!
+//! Implement the `CustomFilter` trait to filter logs based on arbitrary conditions:
+//!
+//! ```rust
+//! struct KeywordFilter(String);
+//!
+//! impl CustomFilter for KeywordFilter {
+//!     fn enabled(&self, record: &log::Record) -> bool {
+//!         !record.args().to_string().contains(&self.0)
+//!     }
+//! }
+//!
+//! let opts = LogOptions::new().filter(KeywordFilter("secret".to_string()));
+//! ```
+//!
+//! ## Notes
+//!
+//! - In debug mode, calling the initialization function more than once will cause the program to crash.
+//! - The log file path must have write permissions.
+//! - Asynchronous mode depends on the `tokio` runtime; ensure proper integration in your project.
+
+
 use std::{
-    collections::VecDeque,
     io::Write,
     str::FromStr,
-    sync::{Mutex, OnceLock},
+    sync::{OnceLock, RwLock},
 };
 
-use std::sync::RwLock;
-
+use crossbeam::queue::ArrayQueue;
 use fnv::FnvHashMap;
+#[cfg(not(feature = "tokio"))]
+use parking_lot::Mutex;
 
 #[cfg(feature = "time")]
 use time::format_description::OwnedFormatItem;
@@ -29,10 +193,10 @@ use tokio::{
 };
 
 /// 格式化后的日志条目缓存最大数量, 超出该数量的Vec不进行缓存
-const CACHE_STR_ARRAY_SIZE: usize = 32;
+const CACHE_STR_ARRAY_SIZE: usize = 64;
 /// 缓存字符串的Vec<u8>的最大大小, 超出该大小的Vec不进行缓存
-const CACHE_STR_INIT_SIZE: usize = 256;
-
+const CACHE_STR_INIT_SIZE: usize = 512;
+/// 全局log对象
 static ASYNC_LOGGER: OnceLock<AsyncLogger> = OnceLock::new();
 
 /// trace_id自增值生成器
@@ -52,6 +216,9 @@ type BoxCustomFilter = Box<dyn CustomFilter>;
 type LevelFilter = RwLock<FnvHashMap<String, log::LevelFilter>>;
 #[cfg(feature = "tokio")]
 type LogRecv = UnboundedReceiver<AsyncLogType>;
+
+#[cfg(all(feature = "time", feature = "chrono"))]
+compile_error!("Only one time or chrono can be selected");
 
 /// `LogOptions` is a struct that holds the configuration for the logger.
 ///
@@ -74,7 +241,7 @@ type LogRecv = UnboundedReceiver<AsyncLogType>;
 ///
 /// # Examples
 ///
-/// ```
+/// ```rust
 /// asnyclog::Builder::new()
 ///     .level(log::LevelFilter::Debug)
 ///     .log_file(String::from("./app.log"))
@@ -102,7 +269,7 @@ pub struct LogOptions {
     filter: Option<BoxCustomFilter>,
 }
 
-/// 自定义过滤函数
+/// custom log filter
 pub trait CustomFilter: Send + Sync + 'static {
     fn enabled(&self, record: &log::Record) -> bool;
 }
@@ -114,7 +281,7 @@ struct AsyncLogger {
     #[cfg(feature = "time")]
     dt_fmt: OwnedFormatItem,
     /// 日志条目时间格式化样式
-    #[cfg(feature = "chrono")]
+    #[cfg(not(feature = "time"))]
     dt_fmt: String,
     /// 日志文件名
     log_file: String,
@@ -123,7 +290,7 @@ struct AsyncLogger {
     /// 用户自定义的过滤目标->过滤级别映射
     level_filter: LevelFilter,
     /// 格式化日志条目时，从该处获取缓存变量存放最后格式化结果
-    fmt_cache: Mutex<VecDeque<Vec<u8>>>,
+    fmt_cache: ArrayQueue<Vec<u8>>,
     /// 异步模式下，用于暂存等待写入日志文件的日志条目
     #[cfg(feature = "tokio")]
     msg_tx: UnboundedSender<AsyncLogType>,
@@ -166,6 +333,7 @@ struct SkipAnsiColorIter<'a> {
     find_len: usize,
 }
 
+/// 异步模式中的消息类型
 enum AsyncLogType {
     Message(Vec<u8>),
     Flush,
@@ -240,7 +408,7 @@ pub fn parse_size(size: &str) -> Result<u32> {
 }
 
 /// It creates a new logger, initializes it, and then sets it as the global logger
-pub fn init_log_inner(opts: LogOptions) -> Result<()> {
+pub fn init_log(opts: LogOptions) -> Result<()> {
     #[cfg(debug_assertions)]
     debug_check_init();
 
@@ -267,9 +435,6 @@ pub fn init_log_inner(opts: LogOptions) -> Result<()> {
     } else {
         None
     };
-
-    let level_filter = RwLock::new(FnvHashMap::default());
-    let fmt_cache = Mutex::new(VecDeque::with_capacity(CACHE_STR_ARRAY_SIZE));
 
     #[cfg(not(feature = "tokio"))]
     {
@@ -314,8 +479,8 @@ pub fn init_log_inner(opts: LogOptions) -> Result<()> {
             dt_fmt,
             log_file: opts.log_file,
             max_size: opts.log_file_max,
-            level_filter,
-            fmt_cache,
+            level_filter: RwLock::new(FnvHashMap::default()),
+            fmt_cache: ArrayQueue::new(CACHE_STR_ARRAY_SIZE),
             filter: opts.filter,
             logger_data: Mutex::new(LogData {
                 log_size,
@@ -343,8 +508,8 @@ pub fn init_log_inner(opts: LogOptions) -> Result<()> {
             dt_fmt,
             log_file: opts.log_file,
             max_size: opts.log_file_max,
-            level_filter,
-            fmt_cache,
+            level_filter: RwLock::new(FnvHashMap::default()),
+            fmt_cache: ArrayQueue::new(CACHE_STR_ARRAY_SIZE),
             msg_tx: tx,
             filter: opts.filter,
         };
@@ -372,19 +537,13 @@ pub fn init_log_inner(opts: LogOptions) -> Result<()> {
 
 #[cfg(not(feature = "tokio"))]
 impl AsyncLogger {
-    // 输出日志到控制台和文件
+    /// 输出日志到控制台和文件
     fn write(&self, msg: &[u8]) {
         if msg.is_empty() {
             return;
         }
 
-        let mut logger_data = match self.logger_data.lock() {
-            Ok(v) => v,
-            Err(e) => {
-                eprint!("log mutex lock failed: {e:?}");
-                return;
-            }
-        };
+        let mut logger_data = self.logger_data.lock();
 
         // 如果启用了控制台输出，则写入控制台
         if let Some(ref mut console) = logger_data.console {
@@ -443,15 +602,9 @@ impl AsyncLogger {
         }
     }
 
-    // 刷新日志的控制台和文件缓存
+    /// 刷新日志的控制台和文件缓存
     fn flush_inner(&self) {
-        let mut logger_data = match self.logger_data.lock() {
-            Ok(v) => v,
-            Err(e) => {
-                eprint!("log mutex lock failed: {e:?}");
-                return;
-            }
-        };
+        let mut logger_data = self.logger_data.lock();
 
         if let Some(ref mut console) = logger_data.console {
             console.flush().expect("flush log console error");
@@ -464,6 +617,7 @@ impl AsyncLogger {
 }
 
 impl AsyncLogger {
+    /// 格式化日志记录
     fn fmt_record(&self, record: &log::Record) -> Option<Vec<u8>> {
         use log::Log;
 
@@ -526,6 +680,7 @@ impl AsyncLogger {
     }
 }
 
+
 impl log::Log for AsyncLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
         if metadata.level() <= self.level
@@ -568,18 +723,11 @@ impl log::Log for AsyncLogger {
         };
 
         // 异步写入模式
-        match self.logger_data.lock() {
-            Ok(logger_data) => {
-                if let Some(ref sender) = logger_data.sender {
-                    // 采用独立的单线程写入日志的方式，向channel发送要写入的日志消息即可
-                    let _ = sender.send(AsyncLogType::Message(msg));
-                    return;
-                }
-            }
-            Err(e) => {
-                eprint!("log mutex lock failed: {e:?}");
-                return;
-            }
+        let logger_data = self.logger_data.lock();
+        if let Some(ref sender) = logger_data.sender {
+            // 采用独立的单线程写入日志的方式，向channel发送要写入的日志消息即可
+            let _ = sender.send(AsyncLogType::Message(msg));
+            return;
         }
 
         // 同步写入模式
@@ -598,15 +746,14 @@ impl log::Log for AsyncLogger {
 
     #[cfg(not(feature = "tokio"))]
     fn flush(&self) {
-        if let Ok(logger_data) = self.logger_data.lock() {
-            if let Some(ref sender) = logger_data.sender {
-                if let Err(e) = sender.send(AsyncLogType::Flush) {
-                    eprint!("failed in log::flush: {e:?}");
-                }
-            } else {
-                drop(logger_data);
-                self.flush_inner();
+        let logger_data = self.logger_data.lock();
+        if let Some(ref sender) = logger_data.sender {
+            if let Err(e) = sender.send(AsyncLogType::Flush) {
+                eprint!("failed in log::flush: {e:?}");
             }
+        } else {
+            drop(logger_data);
+            self.flush_inner();
         }
     }
 }
@@ -626,64 +773,65 @@ impl Default for LogOptions {
 }
 
 impl LogOptions {
+    /// create a new log options with default options
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 根据参数配置, 初始化日志配置
+    /// create a new log with options
     pub fn builder(self) -> Result<()> {
-        init_log_inner(self)
+        init_log(self)
     }
 
-    /// 设置日志级别, 缺省为 log::LevelFilter::Info
+    /// set log level, default: log::LevelFilter::Info
     pub fn level(mut self, level: log::LevelFilter) -> Self {
         self.level = level;
         self
     }
 
-    /// 设置日志文件名, 缺省为空, 即不写入文件
+    /// Set the name of the log file, which is empty by default
     pub fn log_file(mut self, log_file: String) -> Self {
         self.log_file = log_file;
         self
     }
 
-    /// 配置日志文件最大大小, 缺省为 10M
+    /// Configure the maximum log file size, the default is 10M
     pub fn log_file_max(mut self, log_file_max: u32) -> Self {
         self.log_file_max = log_file_max;
         self
     }
 
-    /// 是否使用控制台输出, 缺省为 true
+    /// Whether to use console output. Defaults to true
     pub fn use_console(mut self, use_console: bool) -> Self {
         self.use_console = use_console;
         self
     }
 
-    /// 是否使用异步输出, 缺省为 true
+    /// Whether to use asynchronous output. Defaults to true
     pub fn use_async(mut self, use_async: bool) -> Self {
         self.use_async = use_async;
         self
     }
 
-    /// 设置插件
+    /// Setting up plugins
     pub fn plugin<T: std::io::Write + Send + Sync + 'static>(mut self, plugin: T) -> Self {
         self.plugin = Some(Box::new(plugin));
         self
     }
 
-    /// 设置自定义过滤器
+    /// Set up custom filters
     pub fn filter(mut self, filter: impl CustomFilter) -> Self {
         self.filter = Some(Box::new(filter));
         self
     }
 
-    /// 设置日志级别(字符串方式, 支持"trace", "debug", "info", "warn", "error", "off")
+    /// Set the logging level (string, support the "trace", "debug", "info", "warn", "error", "off")
     pub fn level_str(mut self, level: &str) -> Result<Self> {
         self.level = parse_level(level)?;
         Ok(self)
     }
 
-    /// 设置日志文件最大大小(字符串方式, 支持"K", "M", "G", 例如: "10M" 或者 "1G")
+    /// Set the log file size (string, support the "K", "M", "G", for example: "10 M" or "G")
     pub fn log_file_max_str(mut self, log_file_max: &str) -> Result<Self> {
         self.log_file_max = parse_size(log_file_max)?;
         Ok(self)
@@ -945,8 +1093,8 @@ fn level_color(level: log::Level) -> &'static str {
 }
 
 /// 获取当前时间并格式化为字符串返回
+#[cfg(feature = "time")]
 fn now_as_str(fmt: &OwnedFormatItem) -> String {
-    #[cfg(feature = "time")]
     if let Ok(t) = time::OffsetDateTime::now_local()
         && let Ok(s) = t.format(fmt)
     {
@@ -954,32 +1102,24 @@ fn now_as_str(fmt: &OwnedFormatItem) -> String {
     } else {
         String::new()
     }
+}
 
-    #[cfg(feature = "chrono")]
-    chrono::Local::now().format(&self.dt_fmt)
+#[cfg(not(feature = "time"))]
+fn now_as_str(fmt: &str) -> String {
+    chrono::Local::now().format(fmt)
 }
 
 /// 获取一个用于保存格式化日志条目的对象, 优先从缓存获取，缓存没有则新建一个
 fn get_msg_from_cache() -> Vec<u8> {
-    if let Ok(mut fmt_cache) = get_async_logger().fmt_cache.lock()
-        && let Some(vec) = fmt_cache.pop_back()
-    {
-        return vec;
-    }
-
-    Vec::with_capacity(CACHE_STR_INIT_SIZE)
+    get_async_logger().fmt_cache.pop()
+        .unwrap_or_else(|| Vec::with_capacity(CACHE_STR_INIT_SIZE))
 }
 
 /// 回收Vec<u8>对象，用于下次使用，避免频繁分配内存造成内存碎片
 fn put_msg_to_cache(mut value: Vec<u8>) {
     if value.capacity() <= CACHE_STR_INIT_SIZE {
         value.clear();
-
-        if let Ok(mut fmt_cache) = get_async_logger().fmt_cache.lock()
-            && fmt_cache.len() < fmt_cache.capacity()
-        {
-            fmt_cache.push_back(value);
-        }
+        let _ = get_async_logger().fmt_cache.push(value);
     }
 }
 
