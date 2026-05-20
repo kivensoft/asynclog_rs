@@ -165,7 +165,7 @@
 use std::{
     io::Write,
     str::FromStr,
-    sync::{OnceLock, RwLock},
+    sync::{LazyLock, OnceLock, RwLock},
 };
 
 use crossbeam::queue::ArrayQueue;
@@ -173,8 +173,7 @@ use fnv::FnvHashMap;
 #[cfg(not(feature = "tokio"))]
 use parking_lot::Mutex;
 
-#[cfg(feature = "time")]
-use time::format_description::OwnedFormatItem;
+use time::{Date, OffsetDateTime, format_description::OwnedFormatItem};
 
 #[cfg(feature = "tokio")]
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -198,6 +197,10 @@ const CACHE_STR_ARRAY_SIZE: usize = 64;
 const CACHE_STR_INIT_SIZE: usize = 512;
 /// 全局log对象
 static ASYNC_LOGGER: OnceLock<AsyncLogger> = OnceLock::new();
+static DEF_DT_FMT: LazyLock<OwnedFormatItem> = LazyLock::new(|| {
+    let fmt = "[year]-[month]-[day] [hour]:[minute]:[second]";
+    time::format_description::parse_owned::<2>(fmt).unwrap()
+});
 
 /// trace_id自增值生成器
 #[cfg(feature = "tokio")]
@@ -206,7 +209,7 @@ static TRACE_ID_GENERATOR: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "tokio")]
 tokio::task_local! {
     /// tokio基于异步任务的共享变量(不同的任务之间有不同的trace_id)
-    static TRACE_ID: u32;
+    pub static TRACE_ID: u32;
 }
 
 type IoResult<T> = std::io::Result<T>;
@@ -216,9 +219,6 @@ type BoxCustomFilter = Box<dyn CustomFilter>;
 type LevelFilter = RwLock<FnvHashMap<String, log::LevelFilter>>;
 #[cfg(feature = "tokio")]
 type LogRecv = UnboundedReceiver<AsyncLogType>;
-
-#[cfg(all(feature = "time", feature = "chrono"))]
-compile_error!("Only one time or chrono can be selected");
 
 /// `LogOptions` is a struct that holds the configuration for the logger.
 ///
@@ -242,7 +242,7 @@ compile_error!("Only one time or chrono can be selected");
 /// # Examples
 ///
 /// ```rust
-/// asnyclog::Builder::new()
+/// asnyclog::LogOptions::new()
 ///     .level(log::LevelFilter::Debug)
 ///     .log_file(String::from("./app.log"))
 ///     .log_file_max(1024 * 1024)
@@ -257,7 +257,7 @@ pub struct LogOptions {
     /// The log file path. ignore if the value is empty
     log_file: String,
     /// The maximum size of the log file, The units that can be used are k/m/g.
-    log_file_max: u32,
+    // log_file_max: u32,
     /// Whether to output to the console
     use_console: bool,
     /// Whether to use asynchronous logging, if true, the log will be written to the file in
@@ -278,15 +278,9 @@ struct AsyncLogger {
     /// 日志的有效级别，小于该级别的日志允许输出
     level: log::LevelFilter,
     /// 日志条目时间格式化样式
-    #[cfg(feature = "time")]
     dt_fmt: OwnedFormatItem,
-    /// 日志条目时间格式化样式
-    #[cfg(not(feature = "time"))]
-    dt_fmt: String,
     /// 日志文件名
     log_file: String,
-    /// 日志文件允许的最大长度
-    max_size: u32,
     /// 用户自定义的过滤目标->过滤级别映射
     level_filter: LevelFilter,
     /// 格式化日志条目时，从该处获取缓存变量存放最后格式化结果
@@ -319,6 +313,8 @@ struct LogData {
     /// 文件对象，如果启用了文件输出，则对象有值
     #[cfg(not(feature = "tokio"))]
     fileout: Option<LineWriter<File>>,
+    /// 上一次写入日志时的日期, 写入新日志条目时, 如果当前日期不等于上一次写入的日期, 则进行日志文件轮转
+    last_date: Date,
     /// 异步发送频道，如果启用了异步日志模式，则对象有值
     #[cfg(not(feature = "tokio"))]
     sender: Option<Sender<AsyncLogType>>,
@@ -414,13 +410,10 @@ pub fn init_log(opts: LogOptions) -> Result<()> {
 
     log::set_max_level(opts.level);
 
-    #[cfg(feature = "time")]
     let dt_fmt = {
-        let fmt = "[month]-[day] [hour]:[minute]:[second]";
+        let fmt = "[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]";
         time::format_description::parse_owned::<2>(fmt).unwrap()
     };
-    #[cfg(feature = "chrono")]
-    let dt_fmt = "%m-%d %H:%M:%S".to_string();
 
     // 如果启用控制台输出，创建一个控制台共享句柄
     #[cfg(not(feature = "tokio"))]
@@ -478,7 +471,6 @@ pub fn init_log(opts: LogOptions) -> Result<()> {
             level: opts.level,
             dt_fmt,
             log_file: opts.log_file,
-            max_size: opts.log_file_max,
             level_filter: RwLock::new(FnvHashMap::default()),
             fmt_cache: ArrayQueue::new(CACHE_STR_ARRAY_SIZE),
             filter: opts.filter,
@@ -486,6 +478,7 @@ pub fn init_log(opts: LogOptions) -> Result<()> {
                 log_size,
                 console,
                 fileout,
+                last_date: now().date(),
                 sender,
                 plugin: opts.plugin,
             }),
@@ -507,7 +500,7 @@ pub fn init_log(opts: LogOptions) -> Result<()> {
             level: opts.level,
             dt_fmt,
             log_file: opts.log_file,
-            max_size: opts.log_file_max,
+            // max_size: opts.log_file_max,
             level_filter: RwLock::new(FnvHashMap::default()),
             fmt_cache: ArrayQueue::new(CACHE_STR_ARRAY_SIZE),
             msg_tx: tx,
@@ -526,6 +519,7 @@ pub fn init_log(opts: LogOptions) -> Result<()> {
                 use_file,
                 console,
                 fileout: None,
+                last_date: now().date(),
                 plugin: opts.plugin,
             },
             rx,
@@ -551,43 +545,8 @@ impl AsyncLogger {
         }
 
         // 判断日志长度是否到达最大限制，如果到了，需要备份当前日志文件并重新创建新的日志文件
-        if logger_data.log_size > self.max_size {
-            // 如果启用了日志文件，刷新缓存并关闭日志文件
-            let has_file = match logger_data.fileout {
-                Some(ref mut fileout) => {
-                    let _ = fileout.flush();
-                    logger_data.fileout.take();
-                    true
-                }
-                None => false,
-            };
-
-            // 之所以把关闭文件和重新创建文件分开写，是因为rust限制了可变借用(fileout)只允许1次
-            if has_file {
-                // 删除已有备份，并重命名现有文件为备份文件
-                let bak = format!("{}.bak", self.log_file);
-                if std::fs::remove_file(&bak).is_err() {
-                    eprint!("remove file error: {bak}");
-                }
-                if std::fs::rename(&self.log_file, &bak).is_err() {
-                    eprint!("backup log file fail: {} -> {bak}", &self.log_file);
-                }
-
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&self.log_file)
-                {
-                    Ok(file) => {
-                        logger_data.fileout = Some(LineWriter::new(file));
-                        logger_data.log_size = 0;
-                    }
-                    Err(_) => {
-                        eprint!("open log file error: {}", self.log_file);
-                    }
-                }
-            }
+        if logger_data.fileout.is_some() && now().date() > logger_data.last_date {
+            rolling_file(&mut *logger_data);
         }
 
         if let Some(ref mut fileout) = logger_data.fileout {
@@ -625,13 +584,12 @@ impl AsyncLogger {
         if !self.enabled(record.metadata()) {
             return None;
         }
-        if let Some(filter) = &self.filter
-            && !filter.enabled(record)
-        {
+        if let Some(filter) = &self.filter && !filter.enabled(record) {
             return None;
         }
 
-        let now = now_as_str(&self.dt_fmt);
+        let mut time_buf = TimeBuf::new();
+        let now = time_buf.format_now2(&self.dt_fmt);
         let mut msg = get_msg_from_cache();
         let is_detail = self.level >= log::LevelFilter::Debug;
         let log_level = record.level();
@@ -647,16 +605,14 @@ impl AsyncLogger {
             let _ = write!(&mut msg, "[{now}] [{log_level:5}]");
         }
 
-        // 格式化请求追踪标志(优先级别: task_id > trace_id > thread_name)
+        // 格式化请求追踪标志
         #[cfg(feature = "tokio")]
         if let Some(task_id) = tokio::task::try_id() {
             let _ = write!(&mut msg, " [\x1b[34mTASK:{task_id}\x1b[0m]");
-        } else if let Some(trace_id) = get_trace_id() {
+        }
+        #[cfg(feature = "tokio")]
+        if let Some(trace_id) = get_trace_id() {
             let _ = write!(&mut msg, " [\x1b[35mTRACE:{trace_id}\x1b[0m]");
-        } else {
-            let thread = std::thread::current();
-            let thread_name = thread.name().unwrap_or("unknown");
-            let _ = write!(&mut msg, " [\x1b[32mTHREAD:{thread_name}\x1b[0m]");
         }
         #[cfg(not(feature = "tokio"))]
         {
@@ -763,7 +719,6 @@ impl Default for LogOptions {
         Self {
             level: log::LevelFilter::Info,
             log_file: String::new(),
-            log_file_max: 10 * 1024 * 1024,
             use_console: true,
             use_async: true,
             plugin: None,
@@ -796,10 +751,10 @@ impl LogOptions {
     }
 
     /// Configure the maximum log file size, the default is 10M
-    pub fn log_file_max(mut self, log_file_max: u32) -> Self {
-        self.log_file_max = log_file_max;
-        self
-    }
+    // pub fn log_file_max(mut self, log_file_max: u32) -> Self {
+    //     self.log_file_max = log_file_max;
+    //     self
+    // }
 
     /// Whether to use console output. Defaults to true
     pub fn use_console(mut self, use_console: bool) -> Self {
@@ -831,11 +786,11 @@ impl LogOptions {
         Ok(self)
     }
 
-    /// Set the log file size (string, support the "K", "M", "G", for example: "10 M" or "G")
-    pub fn log_file_max_str(mut self, log_file_max: &str) -> Result<Self> {
-        self.log_file_max = parse_size(log_file_max)?;
-        Ok(self)
-    }
+    // /// Set the log file size (string, support the "K", "M", "G", for example: "10 M" or "G")
+    // pub fn log_file_max_str(mut self, log_file_max: &str) -> Result<Self> {
+    //     self.log_file_max = parse_size(log_file_max)?;
+    //     Ok(self)
+    // }
 }
 
 impl<F: Fn(&log::Record) -> bool + Send + Sync + 'static> CustomFilter for F {
@@ -992,11 +947,63 @@ async fn open_log_file(log_file: &str, append: bool) -> (Option<BufWriter<File>>
     }
 }
 
+fn make_log_bak_file(log_file: &str, date: &Date) -> String {
+    let log_prefix = log_file.strip_suffix(".log").unwrap_or(log_file);
+    let dfmt = time::format_description::parse_owned::<2>("[year][month][day]").unwrap();
+    let date_str = date.format(&dfmt).unwrap();
+    format!("{}.{}.log", log_prefix, date_str)
+}
+
 /// 原日志文件备份为bak后缀, 重新新建日志文件
+#[cfg(not(feature = "tokio"))]
+fn rolling_file(log_data: &mut LogData) {
+    // 刷新日志缓存
+    match log_data.fileout {
+        Some(ref mut fileout) => {
+            // 刷新缓存并关闭日志文件
+            if let Err(e) = fileout.flush() {
+                eprintln!("failed in log flush log file: {e:?}");
+            }
+            true
+        }
+        None => return,
+    };
+
+    // 关闭日志文件
+    log_data.fileout.take();
+
+    // 之所以把关闭文件和重新创建文件分开写，是因为rust限制了可变借用(fileout)只允许1次
+    // 删除已有备份，并重命名现有文件为备份文件
+    let alog = get_async_logger();
+    let today = now().date();
+    let bak = make_log_bak_file(&alog.log_file, &today);
+    let _ = std::fs::remove_file(&bak);
+    if let Err(e) = std::fs::rename(&alog.log_file, &bak) {
+        eprintln!("failed in log rename file: {e:?}");
+        return;
+    }
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&alog.log_file)
+    {
+        Ok(file) => {
+            log_data.fileout = Some(LineWriter::new(file));
+            log_data.log_size = 0;
+            log_data.last_date = today;
+        }
+        Err(_) => {
+            eprint!("open log file error: {}", alog.log_file);
+        }
+    };
+}
+
 #[cfg(feature = "tokio")]
 async fn rolling_file(log_data: &mut LogData) {
     // 刷新日志缓存
-    let has_file = match log_data.fileout {
+    match log_data.fileout {
         Some(ref mut fileout) => {
             // 刷新缓存并关闭日志文件
             if let Err(e) = fileout.flush().await {
@@ -1004,25 +1011,24 @@ async fn rolling_file(log_data: &mut LogData) {
             }
             true
         }
-        None => false,
+        None => return,
     };
 
-    if !has_file {
-        return;
-    };
-
+    // 关闭日志文件``
     log_data.fileout.take();
 
     // 之所以把关闭文件和重新创建文件分开写，是因为rust限制了可变借用(fileout)只允许1次
     // 删除已有备份，并重命名现有文件为备份文件
     let alog = get_async_logger();
-    let bak = format!("{}.bak", alog.log_file);
+    let today = now().date();
+    let bak = make_log_bak_file(&alog.log_file, &today);
     let _ = tokio::fs::remove_file(&bak).await;
     match tokio::fs::rename(&alog.log_file, &bak).await {
         Ok(_) => {
             let (file, _) = open_log_file(&alog.log_file, false).await;
             log_data.fileout = file;
             log_data.log_size = 0;
+            log_data.last_date = today;
         }
         Err(e) => eprintln!("failed in log rename file: {e:?}"),
     }
@@ -1045,7 +1051,7 @@ async fn write_to_log(log_data: &mut LogData, msg: &[u8]) {
     }
 
     // 判断日志长度是否到达最大限制，如果到了，需要备份当前日志文件并重新创建新的日志文件
-    if log_data.log_size > get_async_logger().max_size {
+    if now().date() > log_data.last_date {
         rolling_file(log_data).await
     }
 
@@ -1092,23 +1098,6 @@ fn level_color(level: log::Level) -> &'static str {
     }
 }
 
-/// 获取当前时间并格式化为字符串返回
-#[cfg(feature = "time")]
-fn now_as_str(fmt: &OwnedFormatItem) -> String {
-    if let Ok(t) = time::OffsetDateTime::now_local()
-        && let Ok(s) = t.format(fmt)
-    {
-        s
-    } else {
-        String::new()
-    }
-}
-
-#[cfg(not(feature = "time"))]
-fn now_as_str(fmt: &str) -> String {
-    chrono::Local::now().format(fmt)
-}
-
 /// 获取一个用于保存格式化日志条目的对象, 优先从缓存获取，缓存没有则新建一个
 fn get_msg_from_cache() -> Vec<u8> {
     get_async_logger().fmt_cache.pop()
@@ -1133,5 +1122,70 @@ fn debug_check_init() {
     let r = INITED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
     if r.is_err() {
         panic!("init_log must run once!");
+    }
+}
+
+fn now() -> OffsetDateTime {
+    time::OffsetDateTime::now_local()
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+}
+
+pub struct TimeBuf {
+    buf: [u8; 32],
+    pos: usize,
+}
+
+impl TimeBuf {
+    pub fn new() -> Self {
+        Self { buf: [0; 32], pos: 0 }
+    }
+
+    pub fn as_str(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.pos]) }
+    }
+
+    pub fn format_now(&mut self) -> &str {
+        self.format2(now(), &DEF_DT_FMT)
+    }
+
+    pub fn format_now2<F>(&mut self, fmt: &F) -> &str
+    where
+        F: time::formatting::Formattable + ?Sized
+    {
+        let now = time::OffsetDateTime::now_local()
+            .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        self.format2(now, fmt)
+    }
+
+    pub fn format(&mut self, odt: time::OffsetDateTime) -> &str{
+        self.format2(odt, &DEF_DT_FMT)
+    }
+
+    pub fn format2<F>(&mut self, odt: time::OffsetDateTime, fmt: &F) -> &str
+    where
+        F: time::formatting::Formattable + ?Sized
+    {
+        self.pos = 0;
+        let _ = odt.format_into(self, fmt);
+        self.as_str()
+    }
+
+}
+
+impl std::io::Write for TimeBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let surplus = self.buf.len() - self.pos;
+        let buf_len = buf.len();
+        let count = if buf_len <= surplus { buf_len } else { surplus };
+        if count > 0 {
+            let pos = self.pos;
+            self.buf[pos..pos+count].copy_from_slice(&buf[..count]);
+            self.pos += count;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
